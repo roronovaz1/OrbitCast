@@ -23,6 +23,7 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -63,6 +64,8 @@ import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.FilterQuality
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.rotate
@@ -207,17 +210,30 @@ fun Orbit(active: Boolean, th: Th, mod: Modifier) {
 
 @Composable
 fun QrCard(text: String, box: Dp) {
-    val bm = remember(text) {
-        runCatching { QRCodeWriter().encode(text, BarcodeFormat.QR_CODE, 0, 0, mapOf(EncodeHintType.MARGIN to 0)) }.getOrNull()
-    }
-    Box(Modifier.size(box).clip(RoundedCornerShape(18.dp)).background(Color.White).padding(14.dp)) {
-        if (bm != null) Canvas(Modifier.fillMaxSize()) {
-            val n = bm.width
-            val cell = size.minDimension / n
+    val res = remember(text) {
+        runCatching {
+            val m = QRCodeWriter().encode(text, BarcodeFormat.QR_CODE, 0, 0, mapOf(EncodeHintType.MARGIN to 0))
+            val n = m.width
+            val scale = 10
+            val quiet = 4
+            val dim = (n + quiet * 2) * scale
+            val px = IntArray(dim * dim) { android.graphics.Color.WHITE }
             for (y in 0 until n) for (x in 0 until n) {
-                if (bm.get(x, y)) drawRoundRect(Color.Black, Offset(x * cell, y * cell), Size(cell * 0.94f, cell * 0.94f), CornerRadius(cell * 0.22f))
+                if (m.get(x, y)) {
+                    for (dy in 0 until scale) for (dx in 0 until scale) {
+                        px[((y + quiet) * scale + dy) * dim + (x + quiet) * scale + dx] = android.graphics.Color.BLACK
+                    }
+                }
             }
+            val bmp = android.graphics.Bitmap.createBitmap(dim, dim, android.graphics.Bitmap.Config.ARGB_8888)
+            bmp.setPixels(px, 0, dim, 0, 0, dim, dim)
+            bmp.asImageBitmap()
         }
+    }
+    val img = res.getOrNull()
+    Box(Modifier.size(box).clip(RoundedCornerShape(18.dp)).background(Color.White), contentAlignment = Alignment.Center) {
+        if (img != null) Image(img, "QR code", Modifier.fillMaxSize().padding(6.dp), filterQuality = FilterQuality.None)
+        else Text("QR error: ${res.exceptionOrNull()}", color = Color.Black, fontSize = 11.sp, modifier = Modifier.padding(10.dp))
     }
 }
 
@@ -319,9 +335,19 @@ fun SendSide(th: Th) {
     var addrDlg by remember { mutableStateOf(false) }
     var pinFor by remember { mutableStateOf<Pair<String, Int>?>(null) }
     DisposableEffect(Unit) { Discovery.discover(); onDispose { Discovery.stopDiscover() } }
+    val ctx = LocalContext.current
     val scan = rememberLauncherForActivityResult(ScanContract()) { r ->
         val text = r.contents
-        if (text != null) Sender.connectQr(text)
+        if (text != null) Sender.connectQr(text) else Session.status.value = "No QR read: try again"
+    }
+    fun startScan() {
+        scan.launch(
+            ScanOptions().setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+                .setPrompt("Scan the QR on the receiving phone").setBeepEnabled(false).setOrientationLocked(false)
+        )
+    }
+    val camPerm = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
+        if (ok) startScan() else Session.status.value = "Allow the camera to scan the QR"
     }
     val casting = Session.casting.value
     val status = Session.status.value
@@ -336,10 +362,8 @@ fun SendSide(th: Th) {
         } else {
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 Pill("SCAN QR", th, true) {
-                    scan.launch(
-                        ScanOptions().setDesiredBarcodeFormats(ScanOptions.QR_CODE)
-                            .setPrompt("Scan the QR on the receiving phone").setBeepEnabled(false).setOrientationLocked(false)
-                    )
+                    if (ContextCompat.checkSelfPermission(ctx, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) startScan()
+                    else camPerm.launch(Manifest.permission.CAMERA)
                 }
                 Pill("TYPE ADDRESS", th) { addrDlg = true }
             }
@@ -403,7 +427,7 @@ fun ReceiveSide(th: Th) {
     Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
             Orbit(false, th, Modifier.fillMaxSize())
-            if (payload.isNotEmpty()) QrCard(payload, 190.dp)
+            if (payload.isNotEmpty()) QrCard(payload, 230.dp)
             else T("Join a Wi-Fi network or turn on your hotspot", th, 14, th.dim, Modifier.padding(40.dp), true)
         }
         T("Waiting for a device", th, 16, mod = Modifier.fillMaxWidth(), center = true)

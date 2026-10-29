@@ -28,6 +28,7 @@ import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
+import android.os.Bundle
 import android.os.Environment
 import android.os.Handler
 import android.os.HandlerThread
@@ -52,7 +53,9 @@ import kotlin.concurrent.thread
  */
 class CastService : Service() {
     companion object {
+        @Volatile var instance: CastService? = null
         fun stop(c: Context) { c.stopService(Intent(c, CastService::class.java)) }
+        fun requestKey() { instance?.askKey() }
     }
 
     private val ht = HandlerThread("orbit-enc").apply { start() }
@@ -81,6 +84,11 @@ class CastService : Service() {
 
     override fun onBind(i: Intent?): IBinder? = null
 
+    /** Ask the encoder for a key frame now (a receiver that joins late needs one to start). */
+    fun askKey() {
+        try { enc?.setParameters(Bundle().apply { putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0) }) } catch (_: Exception) {}
+    }
+
     override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
         if (i == null || i.action == "STOP") { stopSelf(); return START_NOT_STICKY }
         rec = i.getStringExtra("mode") == "rec"
@@ -100,6 +108,7 @@ class CastService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
+        instance = this
         Session.casting.value = true
         Session.status.value = if (rec) "Recording" else "Casting"
         return START_NOT_STICKY
@@ -125,7 +134,11 @@ class CastService : Service() {
     private fun begin(mic: Boolean, internal: Boolean) {
         wantAudio = mic || internal
         try {
-            startVideo(Prefs.shortSide, Prefs.mbps, Prefs.fps)
+            // Casting uses safer limits so older receiving phones can decode it; recording keeps your settings
+            val side = if (rec) Prefs.shortSide else (if (Prefs.shortSide == 0 || Prefs.shortSide > 1080) 1080 else Prefs.shortSide)
+            val fps = if (rec) Prefs.fps else minOf(Prefs.fps, 30)
+            val mb = if (rec) Prefs.mbps else minOf(Prefs.mbps, 25)
+            startVideo(side, mb, fps)
         } catch (e: Exception) { // device can't do the chosen settings: fall back to safe ones
             releaseVideo()
             Toast.makeText(this, "Quality not supported, using 1080p 30fps", Toast.LENGTH_SHORT).show()
@@ -353,6 +366,7 @@ class CastService : Service() {
     private fun tick() {
         hd.postDelayed({
             if (!running) return@postDelayed
+            if (!rec) askKey() // a key frame every second, even when the screen is not changing
             Session.stats.value = String.format(Locale.US, "%.1f Mbps · %d fps", bytes * 8 / 1e6, frames)
             bytes = 0; frames = 0
             tick()
@@ -368,6 +382,7 @@ class CastService : Service() {
 
     override fun onDestroy() {
         running = false
+        instance = null
         audioThread?.join(800)
         releaseVideo()
         synchronized(lock) {

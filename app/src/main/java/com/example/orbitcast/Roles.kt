@@ -67,6 +67,7 @@ object Sender {
             when (t) {
                 5 -> { Session.status.value = "Allowed"; Session.pending.value = "cast" }
                 6 -> { Session.status.value = "Denied by receiver"; l.close() }
+                7 -> CastService.requestKey()
             }
         }
         l.onClose = {
@@ -91,12 +92,13 @@ class Decoder {
     private var gotKey = false
 
     @Synchronized
-    fun start(s: Surface, w: Int, h: Int, csd: ByteArray) {
-        if (run && last?.contentEquals(csd) == true) return
+    fun start(s: Surface, w: Int, h: Int, csd: ByteArray): Boolean {
+        if (run && last?.contentEquals(csd) == true) return false
         stop()
         try {
             val f = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, w.coerceAtLeast(16), h.coerceAtLeast(16))
             if (Build.VERSION.SDK_INT >= 30) f.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+            f.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 2 * 1024 * 1024)
             val m = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
             m.configure(f, s, null, 0)
             m.start()
@@ -111,7 +113,8 @@ class Decoder {
                     } catch (_: Exception) { break }
                 }
             }
-        } catch (_: Exception) { stop() }
+            return true
+        } catch (_: Exception) { stop(); return false }
     }
 
     @Synchronized
@@ -127,6 +130,7 @@ class Decoder {
             val i = m.dequeueInputBuffer(20000)
             if (i < 0) return
             val b = m.getInputBuffer(i) ?: return
+            if (d.size > b.capacity()) { m.queueInputBuffer(i, 0, 0, pts, 0); return }
             b.clear(); b.put(d)
             m.queueInputBuffer(i, 0, d.size, pts, flags)
         } catch (_: Exception) {
@@ -246,7 +250,8 @@ object Receiver {
         val s = surface ?: return
         val c = csd ?: return
         if (!viewing.value) return
-        decoder.start(s, vw.intValue, vh.intValue, c)
+        // when the decoder (re)starts, ask the sender for a fresh key frame right away
+        if (decoder.start(s, vw.intValue, vh.intValue, c)) cur?.send(7, ByteArray(0))
     }
 
     fun endSession() {
