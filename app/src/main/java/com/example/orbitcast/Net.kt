@@ -121,7 +121,7 @@ class WsLink(private val url: String, private val room: String, private val role
 }
 
 class LanServer(private val onLink: (Link) -> Unit) {
-    private val srv = ServerSocket(0)
+    private val srv: ServerSocket = try { ServerSocket(7777) } catch (_: Exception) { ServerSocket(0) }
     val port: Int get() = srv.localPort
 
     init {
@@ -201,3 +201,12 @@ object Discovery {
         found.clear()
     }
 }
+
+/** This phone's IPv4 addresses (Wi-Fi or hotspot), for manual connect. */
+fun localIps(): List<String> = try {
+    java.net.NetworkInterface.getNetworkInterfaces().toList()
+        .filter { it.isUp && !it.isLoopback }
+        .flatMap { it.inetAddresses.toList() }
+        .filterIsInstance<java.net.Inet4Address>()
+        .mapNotNull { it.hostAddress }
+} catch (_: Exception) { emptyList() }

@@ -227,6 +227,7 @@ fun Transport(th: Th, internet: Boolean, set: (Boolean) -> Unit) {
 @Composable
 fun CastTab(th: Th, internet: Boolean, setNet: (Boolean) -> Unit) {
     var codeDlg by remember { mutableStateOf(false) }
+    var manualDlg by remember { mutableStateOf(false) }
     var target by remember { mutableStateOf<Pair<String, Int>?>(null) }
     DisposableEffect(Unit) { Discovery.discover(); onDispose { Discovery.stopDiscover() } }
     val casting = Session.casting.value
@@ -250,9 +251,33 @@ fun CastTab(th: Th, internet: Boolean, setNet: (Boolean) -> Unit) {
                     Pill("PAIR", th) { target = e.value; codeDlg = true }
                 }
             }
+            Pill("CONNECT BY ADDRESS", th) { manualDlg = true }
         } else {
             Pill("ENTER CODE", th) { target = null; codeDlg = true }
         }
+    }
+    if (manualDlg) {
+        var ip by remember { mutableStateOf("") }
+        var pc by remember { mutableStateOf("") }
+        AlertDialog(
+            onDismissRequest = { manualDlg = false },
+            title = { T("Connect by address", th, 15) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(ip, { ip = it.trim() }, singleLine = true, label = { Text("Address shown on receiver") })
+                    OutlinedTextField(pc, { pc = it.trim() }, singleLine = true, label = { Text("PIN") })
+                }
+            },
+            confirmButton = {
+                TextButton({
+                    manualDlg = false
+                    val host = ip.substringBefore(':')
+                    val port = ip.substringAfter(':', "7777").toIntOrNull() ?: 7777
+                    Sender.connectLan(host, port, pc)
+                }) { T("CONNECT", th, 13, th.red) }
+            },
+            dismissButton = { TextButton({ manualDlg = false }) { T("CANCEL", th, 13) } }
+        )
     }
     if (codeDlg) {
         var code by remember { mutableStateOf("") }
@@ -284,6 +309,7 @@ fun ReceiveTab(th: Th, internet: Boolean, setNet: (Boolean) -> Unit) {
         } else Receiver.pin.value
         T(code, th, 34, th.red, Modifier.fillMaxWidth(), true)
         T("Enter this code on the casting phone · ${Prefs.deviceName}", th, 12, th.dim, Modifier.fillMaxWidth(), true)
+        if (!internet) T("Address: ${Receiver.addr.value}", th, 12, th.dim, Modifier.fillMaxWidth(), true)
     }
 }
 
@@ -298,8 +324,15 @@ fun RecTab(th: Th) {
     var cd by remember { mutableStateOf(0) }
     val recording = Session.casting.value
     val micPerm = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { Session.pending.value = "rec" }
+    val storagePerm = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
+        if (ok) cd = 1 else Session.status.value = "Allow storage to save recordings"
+    }
 
     fun begin() {
+        if (Build.VERSION.SDK_INT < 29 && ContextCompat.checkSelfPermission(ctx, Manifest.permission.WRITE_EXTERNAL_STORAGE) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            storagePerm.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+            return
+        }
         val need = (mic || inn) && ContextCompat.checkSelfPermission(ctx, Manifest.permission.RECORD_AUDIO) != android.content.pm.PackageManager.PERMISSION_GRANTED
         if (need) micPerm.launch(Manifest.permission.RECORD_AUDIO) else Session.pending.value = "rec"
     }

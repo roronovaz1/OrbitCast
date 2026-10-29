@@ -144,6 +144,7 @@ object Receiver {
     val vw = mutableIntStateOf(0)
     val vh = mutableIntStateOf(0)
     val stats = mutableStateOf("")
+    val addr = mutableStateOf("")
     @Volatile var surface: Surface? = null
 
     private val decoder = Decoder()
@@ -168,6 +169,7 @@ object Receiver {
         newPin()
         lan = LanServer { attach(it, false) }
         Discovery.register(Prefs.deviceName, lan!!.port)
+        lan?.let { l -> addr.value = localIps().joinToString("  ") { ip -> "$ip:${l.port}" } }
         connectRelay()
         tick()
     }
@@ -274,6 +276,7 @@ object Receiver {
         h.postDelayed({
             if (!running) return@postDelayed
             stats.value = String.format("%.1f Mbps · %d fps", bytes * 8 / 1e6, frames)
+            lan?.let { l -> addr.value = localIps().joinToString("  ") { ip -> "$ip:${l.port}" } }
             bytes = 0; frames = 0
             tick()
         }, 1000)

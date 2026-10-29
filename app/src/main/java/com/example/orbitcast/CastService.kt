@@ -23,6 +23,7 @@ import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.media.MediaMuxer
 import android.media.MediaRecorder
+import android.media.MediaScannerConnection
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
@@ -63,6 +64,7 @@ class CastService : Service() {
     private var muxer: MediaMuxer? = null
     private var pfd: ParcelFileDescriptor? = null
     private var uri: Uri? = null
+    private var outFile: File? = null
     private var audioThread: Thread? = null
     private var vTrack = -1
     private var aTrack = -1
@@ -134,6 +136,10 @@ class CastService : Service() {
             try { startAudio(mic, internal) } catch (e: Exception) {
                 synchronized(lock) { wantAudio = false; maybeStartMuxer() }
             }
+            // If no audio ever arrives (some phones), still save the video after 3 seconds
+            hd.postDelayed({
+                synchronized(lock) { if (!started && vTrack >= 0 && aTrack < 0 && wantAudio) { wantAudio = false; maybeStartMuxer() } }
+            }, 3000)
         }
         tick()
     }
@@ -168,6 +174,8 @@ class CastService : Service() {
             setInteger(MediaFormat.KEY_BITRATE_MODE,
                 if (rec) MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR else MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
             setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 500_000L) // keep frames flowing on a static screen
+            setInteger(MediaFormat.KEY_PRIORITY, 0) // real-time priority for smoother capture
+            setInteger(MediaFormat.KEY_OPERATING_RATE, fps)
         }
         val e = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
         e.setCallback(cb, hd)
@@ -253,9 +261,13 @@ class CastService : Service() {
             pfd = p
             return MediaMuxer(p.fileDescriptor, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
         }
-        // Android 9: save to the app's own Movies folder (no storage permission needed)
-        val dir = getExternalFilesDir(Environment.DIRECTORY_MOVIES)!!
-        return MediaMuxer(File(dir, name).path, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+        // Android 9: save to the public Movies/OrbitCast folder (needs storage permission), else the app folder
+        @Suppress("DEPRECATION")
+        var dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES), "OrbitCast")
+        if (!dir.exists() && !dir.mkdirs()) dir = getExternalFilesDir(Environment.DIRECTORY_MOVIES)!!
+        val f = File(dir, name)
+        outFile = f
+        return MediaMuxer(f.path, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
     }
 
     @SuppressLint("MissingPermission")
@@ -296,7 +308,7 @@ class CastService : Service() {
                 val rm = m?.read(a, 0, n) ?: 0
                 val rs = s?.read(b, 0, n) ?: 0
                 val cnt = maxOf(rm, rs)
-                if (cnt <= 0) continue
+                if (cnt <= 0) { Thread.sleep(5); continue }
                 for (j in 0 until cnt) { // mix mic + internal
                     var v = 0
                     if (j < rm) v += a[j]
@@ -313,13 +325,13 @@ class CastService : Service() {
                 while (true) {
                     val oi = ae.dequeueOutputBuffer(bi, 0)
                     if (oi == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                        synchronized(lock) { muxer?.let { aTrack = it.addTrack(ae.outputFormat); maybeStartMuxer() } }
+                        synchronized(lock) { muxer?.let { if (!started) { aTrack = it.addTrack(ae.outputFormat); maybeStartMuxer() } } }
                     } else if (oi >= 0) {
                         val ob = ae.getOutputBuffer(oi)!!
                         if (bi.size > 0 && (bi.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0) {
                             synchronized(lock) {
                                 val mx = muxer
-                                if (started && mx != null) {
+                                if (started && mx != null && aTrack >= 0) {
                                     ob.position(bi.offset); ob.limit(bi.offset + bi.size)
                                     mx.writeSampleData(aTrack, ob, bi)
                                 }
@@ -363,6 +375,7 @@ class CastService : Service() {
             runCatching { muxer?.release() }
             started = false; muxer = null
             runCatching { pfd?.close() }
+            outFile?.let { f -> if (wasStarted) MediaScannerConnection.scanFile(this, arrayOf(f.path), arrayOf("video/mp4"), null) }
             uri?.let { u ->
                 if (!wasStarted) contentResolver.delete(u, null, null)
                 else if (Build.VERSION.SDK_INT >= 29) contentResolver.update(u, ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }, null, null)
