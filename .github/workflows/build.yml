@@ -11,6 +11,8 @@ jobs:
         with:
           distribution: temurin
           java-version: 17
+      - name: Use fixed signing key
+        run: base64 -d app/debug.keystore.b64 > app/debug.keystore
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: 8.9
