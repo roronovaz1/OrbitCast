@@ -175,6 +175,7 @@ class CastService : Service() {
                 if (rec) MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR else MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
             setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 500_000L) // keep frames flowing on a static screen
             setInteger(MediaFormat.KEY_PRIORITY, 0) // real-time priority for smoother capture
+            setInteger("prepend-sps-pps-to-idr-frames", 1) // every key frame carries its own SPS/PPS, so the receiver can start anywhere
             setInteger(MediaFormat.KEY_OPERATING_RATE, fps)
         }
         val e = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)

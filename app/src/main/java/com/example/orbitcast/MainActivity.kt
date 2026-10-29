@@ -4,6 +4,7 @@ import android.Manifest
 import android.app.Activity
 import android.app.PictureInPictureParams
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Bundle
@@ -35,6 +36,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -57,6 +59,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
@@ -68,6 +71,7 @@ import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.Font
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -75,6 +79,11 @@ import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import com.google.zxing.BarcodeFormat
+import com.google.zxing.EncodeHintType
+import com.google.zxing.qrcode.QRCodeWriter
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
 import kotlinx.coroutines.delay
 import kotlin.math.cos
 import kotlin.math.sin
@@ -115,25 +124,100 @@ fun Pill(s: String, th: Th, on: Boolean = false, click: () -> Unit) {
     ) { T(s, th, 13, if (on) th.bg else th.fg) }
 }
 
+/** Layered orbit logo: dial ticks, five tilted dashed orbits, satellites with trails, a dot-matrix core. */
 @Composable
 fun Orbit(active: Boolean, th: Th, mod: Modifier) {
     val tr = rememberInfiniteTransition(label = "orbit")
-    val t by tr.animateFloat(0f, 360f, infiniteRepeatable(tween(if (active) 8000 else 26000, easing = LinearEasing), RepeatMode.Restart), label = "t")
+    val t by tr.animateFloat(0f, 360f, infiniteRepeatable(tween(if (active) 16000 else 48000, easing = LinearEasing), RepeatMode.Restart), label = "t")
+    val p by tr.animateFloat(0f, 1f, infiniteRepeatable(tween(2600, easing = LinearEasing), RepeatMode.Restart), label = "p")
     Canvas(mod) {
         val c = center
-        val r = size.minDimension / 2f * 0.95f
-        val dash = PathEffect.dashPathEffect(floatArrayOf(7f, 9f))
-        val ks = floatArrayOf(1f, 0.78f, 0.58f, 0.38f)
-        for (i in ks.indices) {
-            val k = ks[i]
-            rotate((if (i % 2 == 0) t else -t) * (0.6f + i * 0.35f) + i * 47f, c) {
-                drawOval(th.fg.copy(alpha = 0.75f), Offset(c.x - r * k, c.y - r * k * 0.8f), Size(2 * r * k, 2 * r * k * 0.8f), style = Stroke(1.5f, pathEffect = dash))
+        val r = size.minDimension / 2f * 0.96f
+        val dash = PathEffect.dashPathEffect(floatArrayOf(4f, 9f))
+        val dim = th.fg.copy(alpha = 0.6f)
+        // slow rotating dial
+        rotate(t, c) {
+            for (i in 0 until 72) {
+                val a = Math.toRadians((i * 5).toDouble())
+                val long = i % 6 == 0
+                val r2 = r - (if (long) 14f else 6f)
+                drawLine(
+                    dim.copy(alpha = if (long) 0.95f else 0.35f),
+                    Offset(c.x + r * cos(a).toFloat(), c.y + r * sin(a).toFloat()),
+                    Offset(c.x + r2 * cos(a).toFloat(), c.y + r2 * sin(a).toFloat()),
+                    strokeWidth = if (long) 2f else 1f
+                )
             }
         }
-        val a = Math.toRadians((t * 1.5f).toDouble())
-        drawCircle(th.red, radius = 7f, center = Offset(c.x + (r * 0.78f * cos(a)).toFloat(), c.y + (r * 0.78f * 0.8f * sin(a)).toFloat()))
-        val b = Math.toRadians((-t).toDouble())
-        drawCircle(th.fg, radius = 5f, center = Offset(c.x + (r * 0.58f * cos(b)).toFloat(), c.y + (r * 0.58f * 0.8f * sin(b)).toFloat()))
+        // radius factor, flatness, base tilt, speed (whole numbers so the loop is seamless)
+        val rings = arrayOf(
+            floatArrayOf(0.84f, 0.80f, 12f, 1f),
+            floatArrayOf(0.72f, 0.62f, 70f, -2f),
+            floatArrayOf(0.60f, 0.78f, 130f, 2f),
+            floatArrayOf(0.46f, 0.70f, 30f, -3f),
+            floatArrayOf(0.33f, 0.90f, 95f, 3f),
+        )
+        for (g in rings) {
+            val a = r * g[0]
+            val b = a * g[1]
+            rotate(g[2] + t * g[3], c) {
+                drawOval(dim, Offset(c.x - a, c.y - b), Size(2 * a, 2 * b), style = Stroke(1.3f, pathEffect = dash))
+            }
+        }
+        fun pos(g: FloatArray, deg: Float): Offset {
+            val a = r * g[0]
+            val b = a * g[1]
+            val ang = Math.toRadians(deg.toDouble())
+            val x = a * cos(ang)
+            val y = b * sin(ang)
+            val rot = Math.toRadians((g[2] + t * g[3]).toDouble())
+            return Offset(c.x + (x * cos(rot) - y * sin(rot)).toFloat(), c.y + (x * sin(rot) + y * cos(rot)).toFloat())
+        }
+        // red satellite with a fading trail
+        for (k in 4 downTo 1) {
+            drawCircle(th.red.copy(alpha = 0.7f - k * 0.15f), radius = 6f - k, center = pos(rings[1], t * 4 - k * 9))
+        }
+        drawCircle(th.red, radius = 7f, center = pos(rings[1], t * 4))
+        // white satellite
+        drawCircle(th.fg, radius = 5f, center = pos(rings[0], -t * 2 + 40))
+        // hollow satellite
+        drawCircle(th.fg, radius = 7f, center = pos(rings[2], t * 3), style = Stroke(1.5f))
+        // plus marker
+        val pm = pos(rings[3], -t * 3 + 120)
+        drawLine(th.fg, Offset(pm.x - 6, pm.y), Offset(pm.x + 6, pm.y), strokeWidth = 1.5f)
+        drawLine(th.fg, Offset(pm.x, pm.y - 6), Offset(pm.x, pm.y + 6), strokeWidth = 1.5f)
+        // small dot on the inner orbit
+        drawCircle(dim, radius = 3f, center = pos(rings[4], t * 5))
+        // dot-matrix core
+        val counts = intArrayOf(8, 14, 22)
+        for (j in counts.indices) {
+            val rad = r * (0.09f + 0.07f * j)
+            for (i in 0 until counts[j]) {
+                val a = Math.toRadians(i * 360.0 / counts[j] + j * 12)
+                val al = 0.25f + 0.75f * (0.5f + 0.5f * sin(2 * Math.PI * (p - j * 0.15)).toFloat())
+                drawCircle(th.fg.copy(alpha = al), radius = 1.8f, center = Offset(c.x + rad * cos(a).toFloat(), c.y + rad * sin(a).toFloat()))
+            }
+        }
+        drawCircle(th.red, radius = 4f, center = c)
+        if (active) {
+            drawCircle(th.red.copy(alpha = (1f - p) * 0.7f), radius = r * (0.1f + 0.5f * p), center = c, style = Stroke(2f))
+        }
+    }
+}
+
+@Composable
+fun QrCard(text: String, box: Dp) {
+    val bm = remember(text) {
+        runCatching { QRCodeWriter().encode(text, BarcodeFormat.QR_CODE, 0, 0, mapOf(EncodeHintType.MARGIN to 0)) }.getOrNull()
+    }
+    Box(Modifier.size(box).clip(RoundedCornerShape(18.dp)).background(Color.White).padding(14.dp)) {
+        if (bm != null) Canvas(Modifier.fillMaxSize()) {
+            val n = bm.width
+            val cell = size.minDimension / n
+            for (y in 0 until n) for (x in 0 until n) {
+                if (bm.get(x, y)) drawRoundRect(Color.Black, Offset(x * cell, y * cell), Size(cell * 0.94f, cell * 0.94f), CornerRadius(cell * 0.22f))
+            }
+        }
     }
 }
 
@@ -151,7 +235,7 @@ fun App() {
     else lightColorScheme(background = th.bg, surface = th.bg, primary = th.red, onSurface = th.fg)
     val ctx = LocalContext.current
     var tab by remember { mutableStateOf(0) }
-    var internet by remember { mutableStateOf(false) }
+    var role by remember { mutableStateOf(0) } // 0 = this phone sends its screen, 1 = this phone plays the cast
 
     // Screen-capture permission: shared by Cast (after the receiver allows) and Rec.
     val projLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
@@ -179,7 +263,7 @@ fun App() {
     MaterialTheme(colorScheme = scheme) {
         Box(Modifier.fillMaxSize().background(th.bg)) {
             Column(Modifier.fillMaxSize().systemBarsPadding().padding(horizontal = 20.dp, vertical = 14.dp)) {
-                val names = listOf("CAST", "RECEIVE", "REC", "SET")
+                val names = listOf("CAST", "REC", "SET")
                 T(names[tab], th, 36)
                 Spacer(Modifier.height(10.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(18.dp)) {
@@ -190,9 +274,8 @@ fun App() {
                 Spacer(Modifier.height(14.dp))
                 Box(Modifier.weight(1f).fillMaxWidth()) {
                     when (tab) {
-                        0 -> CastTab(th, internet) { internet = it }
-                        1 -> ReceiveTab(th, internet) { internet = it }
-                        2 -> RecTab(th)
+                        0 -> CastTab(th, role) { role = it }
+                        1 -> RecTab(th)
                         else -> SetTab(th, dark) { dark = it; Prefs.dark = it }
                     }
                 }
@@ -217,50 +300,64 @@ fun App() {
 }
 
 @Composable
-fun Transport(th: Th, internet: Boolean, set: (Boolean) -> Unit) {
-    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-        Pill("WI-FI", th, !internet) { set(false) }
-        Pill("INTERNET", th, internet) { set(true) }
+fun CastTab(th: Th, role: Int, setRole: (Int) -> Unit) {
+    Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Pill("SEND", th, role == 0) { setRole(0) }
+            Pill("RECEIVE", th, role == 1) { setRole(1) }
+        }
+        T(
+            if (role == 0) "This phone's screen goes to another phone" else "This phone plays another phone's screen",
+            th, 12, th.dim
+        )
+        Box(Modifier.weight(1f).fillMaxWidth()) { if (role == 0) SendSide(th) else ReceiveSide(th) }
     }
 }
 
 @Composable
-fun CastTab(th: Th, internet: Boolean, setNet: (Boolean) -> Unit) {
-    var codeDlg by remember { mutableStateOf(false) }
-    var manualDlg by remember { mutableStateOf(false) }
-    var target by remember { mutableStateOf<Pair<String, Int>?>(null) }
+fun SendSide(th: Th) {
+    var addrDlg by remember { mutableStateOf(false) }
+    var pinFor by remember { mutableStateOf<Pair<String, Int>?>(null) }
     DisposableEffect(Unit) { Discovery.discover(); onDispose { Discovery.stopDiscover() } }
+    val scan = rememberLauncherForActivityResult(ScanContract()) { r ->
+        val text = r.contents
+        if (text != null) Sender.connectQr(text)
+    }
     val casting = Session.casting.value
     val status = Session.status.value
     Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        Transport(th, internet, setNet)
         Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
             Orbit(casting || status.endsWith("…"), th, Modifier.fillMaxSize())
         }
-        T(status, th, 18, mod = Modifier.fillMaxWidth(), center = true)
+        T(status, th, 16, mod = Modifier.fillMaxWidth(), center = true)
         if (casting) {
             T(Session.stats.value, th, 12, th.dim, Modifier.fillMaxWidth(), true)
             Pill("STOP", th, true) { Session.app?.let { CastService.stop(it) } }
-        } else if (!internet) {
-            T("DEVICES", th, 14, th.dim)
+        } else {
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                Pill("SCAN QR", th, true) {
+                    scan.launch(
+                        ScanOptions().setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+                            .setPrompt("Scan the QR on the receiving phone").setBeepEnabled(false).setOrientationLocked(false)
+                    )
+                }
+                Pill("TYPE ADDRESS", th) { addrDlg = true }
+            }
             val list = Discovery.found.entries.toList()
-            if (list.isEmpty()) T("Open RECEIVE on the other phone…", th, 13, th.dim)
+            if (list.isNotEmpty()) T("NEARBY", th, 12, th.dim)
             list.forEach { e ->
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                    T(e.key.uppercase(), th, 18)
-                    Pill("PAIR", th) { target = e.value; codeDlg = true }
+                    T(e.key.uppercase(), th, 16)
+                    Pill("PAIR", th) { pinFor = e.value }
                 }
             }
-            Pill("CONNECT BY ADDRESS", th) { manualDlg = true }
-        } else {
-            Pill("ENTER CODE", th) { target = null; codeDlg = true }
         }
     }
-    if (manualDlg) {
+    if (addrDlg) {
         var ip by remember { mutableStateOf("") }
         var pc by remember { mutableStateOf("") }
         AlertDialog(
-            onDismissRequest = { manualDlg = false },
+            onDismissRequest = { addrDlg = false },
             title = { T("Connect by address", th, 15) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -270,46 +367,49 @@ fun CastTab(th: Th, internet: Boolean, setNet: (Boolean) -> Unit) {
             },
             confirmButton = {
                 TextButton({
-                    manualDlg = false
+                    addrDlg = false
                     val host = ip.substringBefore(':')
                     val port = ip.substringAfter(':', "7777").toIntOrNull() ?: 7777
-                    Sender.connectLan(host, port, pc)
+                    Sender.connectLan(listOf(host), port, pc)
                 }) { T("CONNECT", th, 13, th.red) }
             },
-            dismissButton = { TextButton({ manualDlg = false }) { T("CANCEL", th, 13) } }
+            dismissButton = { TextButton({ addrDlg = false }) { T("CANCEL", th, 13) } }
         )
     }
-    if (codeDlg) {
-        var code by remember { mutableStateOf("") }
+    pinFor?.let { hp ->
+        var pc by remember { mutableStateOf("") }
         AlertDialog(
-            onDismissRequest = { codeDlg = false },
-            title = { T(if (internet) "Code (ROOM-123456)" else "PIN shown on receiver", th, 15) },
-            text = { OutlinedTextField(code, { code = it }, singleLine = true) },
+            onDismissRequest = { pinFor = null },
+            title = { T("PIN shown on receiver", th, 15) },
+            text = { OutlinedTextField(pc, { pc = it.trim() }, singleLine = true) },
             confirmButton = {
                 TextButton({
-                    codeDlg = false
-                    val tg = target
-                    if (internet) Sender.connectRelay(code) else if (tg != null) Sender.connectLan(tg.first, tg.second, code)
+                    pinFor = null
+                    Sender.connectLan(listOf(hp.first), hp.second, pc)
                 }) { T("CONNECT", th, 13, th.red) }
             },
-            dismissButton = { TextButton({ codeDlg = false }) { T("CANCEL", th, 13) } }
+            dismissButton = { TextButton({ pinFor = null }) { T("CANCEL", th, 13) } }
         )
     }
 }
 
 @Composable
-fun ReceiveTab(th: Th, internet: Boolean, setNet: (Boolean) -> Unit) {
+fun ReceiveSide(th: Th) {
     DisposableEffect(Unit) { Receiver.start(); onDispose { Receiver.stop() } }
-    Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        Transport(th, internet, setNet)
-        Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) { Orbit(false, th, Modifier.fillMaxSize()) }
-        T("Waiting for a device", th, 18, mod = Modifier.fillMaxWidth(), center = true)
-        val code = if (internet) {
-            if (Prefs.relay.isBlank()) "SET RELAY URL IN SET" else Receiver.room.value + "-" + Receiver.pin.value
-        } else Receiver.pin.value
-        T(code, th, 34, th.red, Modifier.fillMaxWidth(), true)
-        T("Enter this code on the casting phone · ${Prefs.deviceName}", th, 12, th.dim, Modifier.fillMaxWidth(), true)
-        if (!internet) T("Address: ${Receiver.addr.value}", th, 12, th.dim, Modifier.fillMaxWidth(), true)
+    val ips = Receiver.ips.value
+    val port = Receiver.port.intValue
+    val pin = Receiver.pin.value
+    val payload = if (port > 0 && ips.isNotEmpty()) Pairing.payload(ips, port, pin, Prefs.deviceName) else ""
+    Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+            Orbit(false, th, Modifier.fillMaxSize())
+            if (payload.isNotEmpty()) QrCard(payload, 190.dp)
+            else T("Join a Wi-Fi network or turn on your hotspot", th, 14, th.dim, Modifier.padding(40.dp), true)
+        }
+        T("Waiting for a device", th, 16, mod = Modifier.fillMaxWidth(), center = true)
+        T(pin, th, 34, th.red, Modifier.fillMaxWidth(), true)
+        T("Scan the QR on the casting phone", th, 12, th.dim, Modifier.fillMaxWidth(), true)
+        if (ips.isNotEmpty()) T(ips.joinToString("   ") { "$it:$port" }, th, 11, th.dim, Modifier.fillMaxWidth(), true)
     }
 }
 
@@ -322,18 +422,18 @@ fun RecTab(th: Th) {
     var mic by remember { mutableStateOf(Prefs.mic) }
     var inn by remember { mutableStateOf(Prefs.internal) }
     var cd by remember { mutableStateOf(0) }
-    val recording = Session.casting.value
+    val recording = Session.casting.value && Session.status.value == "Recording"
     val micPerm = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { Session.pending.value = "rec" }
     val storagePerm = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
         if (ok) cd = 1 else Session.status.value = "Allow storage to save recordings"
     }
 
     fun begin() {
-        if (Build.VERSION.SDK_INT < 29 && ContextCompat.checkSelfPermission(ctx, Manifest.permission.WRITE_EXTERNAL_STORAGE) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+        if (Build.VERSION.SDK_INT < 29 && ContextCompat.checkSelfPermission(ctx, Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
             storagePerm.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
             return
         }
-        val need = (mic || inn) && ContextCompat.checkSelfPermission(ctx, Manifest.permission.RECORD_AUDIO) != android.content.pm.PackageManager.PERMISSION_GRANTED
+        val need = (mic || inn) && ContextCompat.checkSelfPermission(ctx, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED
         if (need) micPerm.launch(Manifest.permission.RECORD_AUDIO) else Session.pending.value = "rec"
     }
     LaunchedEffect(cd) {
@@ -387,7 +487,6 @@ fun RecTab(th: Th) {
 
 @Composable
 fun SetTab(th: Th, dark: Boolean, setDark: (Boolean) -> Unit) {
-    var relay by remember { mutableStateOf(Prefs.relay) }
     var name by remember { mutableStateOf(Prefs.deviceName) }
     var trusted by remember { mutableStateOf(Prefs.trusted) }
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -398,10 +497,6 @@ fun SetTab(th: Th, dark: Boolean, setDark: (Boolean) -> Unit) {
         }
         T("DEVICE NAME", th, 12, th.dim)
         OutlinedTextField(name, { name = it; Prefs.deviceName = it }, singleLine = true)
-        T("INTERNET RELAY URL", th, 12, th.dim)
-        OutlinedTextField(relay, { relay = it.trim(); Prefs.relay = relay }, singleLine = true,
-            placeholder = { Text("wss://your-relay.example.com") })
-        T("Leave empty to use Wi-Fi only. See server/README for the relay.", th, 12, th.dim)
         T("TRUSTED DEVICES", th, 12, th.dim)
         if (trusted.isEmpty()) T("None", th, 13) else trusted.forEach { T(it, th, 14) }
         if (trusted.isNotEmpty()) Pill("FORGET ALL", th) { Prefs.trusted = emptySet(); trusted = emptySet() }

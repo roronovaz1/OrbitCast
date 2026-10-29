@@ -11,6 +11,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.net.SocketTimeoutException
 import java.nio.ByteBuffer
 import java.security.SecureRandom
 import javax.crypto.spec.SecretKeySpec
@@ -29,29 +30,33 @@ object Session {
 }
 
 object Sender {
-    private fun pinOf(code: String) = code.trim().substringAfterLast('-')
-    private fun roomOf(code: String) = code.trim().substringBefore('-', "").uppercase()
-
-    fun connectLan(host: String, port: Int, code: String) {
-        Session.status.value = "Connecting…"
-        thread(isDaemon = true) {
-            try {
-                val s = Socket()
-                s.tcpNoDelay = true
-                s.connect(InetSocketAddress(host, port), 4000)
-                begin(TcpLink(s), pinOf(code))
-            } catch (e: Exception) {
-                Session.status.value = "Can't reach that device"
-            }
-        }
+    fun connectQr(text: String) {
+        val i = Pairing.parse(text)
+        if (i == null) { Session.status.value = "That QR is not from Orbit Cast"; return }
+        connectLan(i.ips, i.port, i.pin)
     }
 
-    fun connectRelay(code: String) {
-        if (Prefs.relay.isBlank()) { Session.status.value = "Set the relay URL in SET first"; return }
-        val room = roomOf(code)
-        if (room.isEmpty()) { Session.status.value = "Code looks like ROOM-123456"; return }
+    /** Tries each address of the receiver (Wi-Fi and hotspot) until one answers. */
+    fun connectLan(hosts: List<String>, port: Int, pin: String) {
         Session.status.value = "Connecting…"
-        thread(isDaemon = true) { begin(WsLink(Prefs.relay, room, "sender"), pinOf(code)) }
+        thread(isDaemon = true) {
+            var timedOut = false
+            for (h in hosts) {
+                try {
+                    val s = Socket()
+                    s.tcpNoDelay = true
+                    s.connect(InetSocketAddress(h, port), 2500)
+                    begin(TcpLink(s), pin.trim())
+                    return@thread
+                } catch (e: SocketTimeoutException) {
+                    timedOut = true
+                } catch (e: Exception) {
+                }
+            }
+            Session.status.value =
+                if (timedOut) "Can't reach the receiver. Your router may block phone-to-phone traffic: try a hotspot"
+                else "Receiver not ready: open CAST > RECEIVE on it"
+        }
     }
 
     private fun begin(l: Link, pin: String) {
@@ -67,8 +72,9 @@ object Sender {
         l.onClose = {
             if (Session.link === l) {
                 Session.link = null
-                if (Session.status.value == "Waiting for receiver…") Session.status.value = "Wrong code or receiver closed"
-                else if (!Session.casting.value) Session.status.value = "Disconnected"
+                val s = Session.status.value
+                if (s == "Waiting for receiver…") Session.status.value = "Receiver closed or wrong PIN"
+                else if (!Session.casting.value && s != "Denied by receiver") Session.status.value = "Disconnected"
                 Session.app?.let { CastService.stop(it) }
             }
         }
@@ -140,18 +146,17 @@ object Receiver {
     val viewing = mutableStateOf(false)
     val ask = mutableStateOf<String?>(null)
     val pin = mutableStateOf("")
-    val room = mutableStateOf("")
+    val ips = mutableStateOf<List<String>>(emptyList())
+    val port = mutableIntStateOf(0)
     val vw = mutableIntStateOf(0)
     val vh = mutableIntStateOf(0)
     val stats = mutableStateOf("")
-    val addr = mutableStateOf("")
     @Volatile var surface: Surface? = null
 
     private val decoder = Decoder()
     private var csd: ByteArray? = null
     private var key: SecretKeySpec? = null
     private var lan: LanServer? = null
-    private var relayLink: Link? = null
     private var cur: Link? = null
     private var peer = ""
     private var allowed = false
@@ -165,12 +170,12 @@ object Receiver {
     fun start() {
         if (running) return
         running = true
-        room.value = (1..6).map { "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"[rnd.nextInt(32)] }.joinToString("")
         newPin()
-        lan = LanServer { attach(it, false) }
-        Discovery.register(Prefs.deviceName, lan!!.port)
-        lan?.let { l -> addr.value = localIps().joinToString("  ") { ip -> "$ip:${l.port}" } }
-        connectRelay()
+        val s = LanServer { attach(it) }
+        lan = s
+        port.intValue = s.port
+        ips.value = localIps()
+        Discovery.register(Prefs.deviceName, s.port)
         tick()
     }
 
@@ -179,21 +184,9 @@ object Receiver {
         key = Crypto.key(pin.value)
     }
 
-    private fun connectRelay() {
-        if (!running || Prefs.relay.isBlank()) return
-        val l = WsLink(Prefs.relay, room.value, "receiver")
-        relayLink = l
-        attach(l, true)
-    }
-
-    private fun attach(l: Link, relay: Boolean) {
+    private fun attach(l: Link) {
         l.onMsg = { t, d -> handle(l, t, d) }
-        l.onClose = {
-            h.post {
-                if (cur === l) endSession()
-                if (relay && running) h.postDelayed({ connectRelay() }, 2000)
-            }
-        }
+        l.onClose = { h.post { if (cur === l) endSession() } }
         l.start()
     }
 
@@ -269,15 +262,15 @@ object Receiver {
         endSession()
         lan?.close(); lan = null
         Discovery.unregister()
-        relayLink?.close(); relayLink = null
     }
 
     private fun tick() {
         h.postDelayed({
             if (!running) return@postDelayed
             stats.value = String.format("%.1f Mbps · %d fps", bytes * 8 / 1e6, frames)
-            lan?.let { l -> addr.value = localIps().joinToString("  ") { ip -> "$ip:${l.port}" } }
             bytes = 0; frames = 0
+            val n = localIps()
+            if (n != ips.value) ips.value = n
             tick()
         }, 1000)
     }

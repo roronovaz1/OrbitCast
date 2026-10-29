@@ -1,26 +1,23 @@
 package com.example.orbitcast
 
 import android.content.Context
+import android.net.Uri
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.os.Handler
 import android.os.Looper
 import androidx.compose.runtime.mutableStateMapOf
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.Response
-import okhttp3.WebSocket
-import okhttp3.WebSocketListener
-import okio.ByteString
-import okio.ByteString.Companion.toByteString
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.DataInputStream
 import java.io.DataOutputStream
+import java.net.Inet4Address
+import java.net.NetworkInterface
 import java.net.ServerSocket
 import java.net.Socket
 import java.security.SecureRandom
-import java.util.concurrent.TimeUnit
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicLong
 import javax.crypto.Cipher
 import javax.crypto.SecretKeyFactory
 import javax.crypto.spec.GCMParameterSpec
@@ -29,8 +26,7 @@ import javax.crypto.spec.SecretKeySpec
 import kotlin.concurrent.thread
 
 /**
- * Message types (1 byte) shared by both transports:
- * 1 HELLO(enc name)  2 CONFIG(enc w,h,csd)  3 KEY FRAME(enc pts+data)  4 DELTA FRAME  5 ALLOW  6 DENY
+ * Message types (1 byte): 1 HELLO(enc name)  2 CONFIG(enc w,h,csd)  3 KEY FRAME  4 DELTA FRAME  5 ALLOW  6 DENY
  */
 object Crypto {
     private val rnd = SecureRandom()
@@ -63,9 +59,11 @@ abstract class Link {
     abstract fun close()
 }
 
-/** Direct phone-to-phone link on the same Wi-Fi. */
+/** Direct phone-to-phone link on the same Wi-Fi / hotspot. */
 class TcpLink(private val s: Socket) : Link() {
     private val out = DataOutputStream(BufferedOutputStream(s.getOutputStream(), 1 shl 16))
+    private val ex = Executors.newSingleThreadExecutor()
+    private val pending = AtomicLong(0)
 
     override fun start() {
         thread(isDaemon = true) {
@@ -85,39 +83,29 @@ class TcpLink(private val s: Socket) : Link() {
         }
     }
 
-    @Synchronized
+    /** Writes happen on a background thread: Android forbids network access on the main (UI) thread. */
     override fun send(t: Int, d: ByteArray) {
-        try { out.writeByte(t); out.writeInt(d.size); out.write(d); out.flush() } catch (_: Exception) { close() }
-    }
-
-    override fun close() { runCatching { s.close() } }
-}
-
-/** Internet link through the relay server (see /server). Frames stay end-to-end encrypted. */
-class WsLink(private val url: String, private val room: String, private val role: String) : Link() {
-    private var ws: WebSocket? = null
-
-    override fun start() {
-        val client = OkHttpClient.Builder().pingInterval(15, TimeUnit.SECONDS).readTimeout(0, TimeUnit.MILLISECONDS).build()
-        val req = Request.Builder().url("${url.trimEnd('/')}/$room/$role").build()
-        ws = client.newWebSocket(req, object : WebSocketListener() {
-            override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
-                val a = bytes.toByteArray()
-                if (a.isNotEmpty()) onMsg(a[0].toInt() and 255, a.copyOfRange(1, a.size))
+        if (t == 4 && pending.get() > 3_000_000) return // drop delta frames if the network is congested
+        pending.addAndGet(d.size.toLong())
+        try {
+            ex.execute {
+                try {
+                    out.writeByte(t); out.writeInt(d.size); out.write(d); out.flush()
+                } catch (_: Exception) {
+                    runCatching { s.close() }
+                } finally {
+                    pending.addAndGet(-d.size.toLong())
+                }
             }
-            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) { webSocket.close(code, reason) }
-            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) { onClose() }
-            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) { onClose() }
-        })
+        } catch (_: Exception) {
+        }
     }
 
-    override fun send(t: Int, d: ByteArray) {
-        val w = ws ?: return
-        if (t == 4 && w.queueSize() > 3_000_000) return // drop delta frames when the uplink is congested
-        w.send((byteArrayOf(t.toByte()) + d).toByteString())
+    override fun close() {
+        try { ex.execute { runCatching { s.close() } } } catch (_: Exception) {}
+        ex.shutdown()
+        thread(isDaemon = true) { Thread.sleep(1500); runCatching { s.close() } } // hard close if a write is stuck
     }
-
-    override fun close() { ws?.close(1000, null) }
 }
 
 class LanServer(private val onLink: (Link) -> Unit) {
@@ -138,6 +126,34 @@ class LanServer(private val onLink: (Link) -> Unit) {
     }
 
     fun close() { runCatching { srv.close() } }
+}
+
+/** This phone's IPv4 addresses on Wi-Fi / hotspot (mobile-data interfaces are skipped). */
+fun localIps(): List<String> = try {
+    NetworkInterface.getNetworkInterfaces().toList()
+        .filter { n -> n.isUp && !n.isLoopback && listOf("rmnet", "ccmni", "tun", "dummy", "clat", "v4-").none { p -> n.name.startsWith(p) } }
+        .flatMap { it.inetAddresses.toList() }
+        .filterIsInstance<Inet4Address>()
+        .filter { !it.isLinkLocalAddress }
+        .mapNotNull { it.hostAddress }
+} catch (_: Exception) { emptyList() }
+
+/** What the receiver puts in its QR code, and how the sender reads it. */
+object Pairing {
+    class Info(val ips: List<String>, val port: Int, val pin: String)
+
+    fun payload(ips: List<String>, port: Int, pin: String, name: String): String =
+        "orbitcast://c?ip=${ips.joinToString(",")}&p=$port&pin=$pin&n=${Uri.encode(name)}"
+
+    fun parse(s: String): Info? {
+        return try {
+            val u = Uri.parse(s.trim())
+            if (u.scheme != "orbitcast") return null
+            val ips = u.getQueryParameter("ip")?.split(",")?.filter { it.isNotBlank() } ?: return null
+            val pin = u.getQueryParameter("pin") ?: return null
+            Info(ips, u.getQueryParameter("p")?.toIntOrNull() ?: 7777, pin)
+        } catch (_: Exception) { null }
+    }
 }
 
 /** Finds receivers on the local Wi-Fi (mDNS / NSD) and advertises this phone when it is receiving. */
@@ -201,12 +217,3 @@ object Discovery {
         found.clear()
     }
 }
-
-/** This phone's IPv4 addresses (Wi-Fi or hotspot), for manual connect. */
-fun localIps(): List<String> = try {
-    java.net.NetworkInterface.getNetworkInterfaces().toList()
-        .filter { it.isUp && !it.isLoopback }
-        .flatMap { it.inetAddresses.toList() }
-        .filterIsInstance<java.net.Inet4Address>()
-        .mapNotNull { it.hostAddress }
-} catch (_: Exception) { emptyList() }
